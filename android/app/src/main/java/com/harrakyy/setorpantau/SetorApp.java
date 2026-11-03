@@ -66,10 +66,12 @@ public class SetorApp extends Application {
             long time = n.optLong("time", System.currentTimeMillis());
             String id = SetorNotifier.notifId(n.optString("package"), time, text);
             if (!handled.add(id)) continue;
-            JSONObject conn = SetorNotifier.target(conns, amount);
+            JSONObject conn = SetorNotifier.target(conns, amount, time);
             if (conn == null) {
                 SetorNotifier.show(this, id, SetorNotifier.rupiah(amount) + " masuk",
                         conns.length() == 0 ? "DANA · tercatat di HP" : "DANA · di luar jalur usaha, disimpan di HP saja");
+            } else if (conn.optString("url", "").isEmpty()) {
+                SetorNotifier.show(this, id, SetorNotifier.rupiah(amount) + " masuk", conn.optString("business", "Bisnis") + " · tercatat di HP");
             } else {
                 new Thread(() -> SetorNotifier.deliver(this, conn, id, amount, time, text)).start();
             }

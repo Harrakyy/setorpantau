@@ -335,8 +335,10 @@
       </div>
       <div class="card">
         <h3>Data</h3>
-        <p>Catatan transaksi tersimpan di HP ini dan ikut terhapus kalau Setor di-uninstall. Simpan cadangan dulu, lalu pulihkan setelah pasang lagi.</p>
-        <button id="backupSave" class="btn primary" type="button">Simpan cadangan</button>
+        <p>Setor menyimpan cadangan otomatis sekali sehari di folder <b>Documents/Setor</b> (tetap ada walau Setor di-uninstall). Hanya cadangan terakhir yang disimpan, yaitu data sampai kemarin. Transaksi yang sudah terkirim ke web juga bisa diambil lagi lewat scan QR.</p>
+        <p id="autoBakInfo" class="notice ok">Cadangan otomatis: belum ada</p>
+        <button id="backupLast" class="btn primary" type="button">Pulihkan cadangan terakhir</button>
+        <button id="backupSave" class="btn" type="button">Simpan cadangan sekarang</button>
         <label class="btn" for="backupFile">Pulihkan dari cadangan</label>
         <input id="backupFile" type="file" accept="application/json,.json" class="sr-only">
         <button id="exportCsv2" class="btn" type="button">Ekspor semua ke CSV</button>
@@ -371,19 +373,28 @@
     </nav>
   </div>
 
-  <!-- Hubungkan usaha: scan QR dari web usaha, atau ketik alamat + kode -->
+  <!-- Tambah/ubah bisnis: nama bebas + rentang 3 digit (otomatis dari sisa angka), opsional hubungkan ke web -->
   <dialog id="pairSheet" aria-labelledby="pairTitle">
     <form method="dialog" class="sheet">
-      <div class="big" id="pairTitle" style="font-size:24px">Hubungkan usaha</div>
-      <button id="scanQr" class="btn primary" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 9V5a1 1 0 0 1 1-1h4M15 4h4a1 1 0 0 1 1 1v4M20 15v4a1 1 0 0 1-1 1h-4M9 20H5a1 1 0 0 1-1-1v-4M4 12h16"/></svg>Scan QR dari web usaha</button>
-      <p class="hint">Kosinyuk: Pengaturan → Hubungkan HP. Atmosphere: Admin → Pengaturan → Buat kode pairing.</p>
-      <div class="divider"><span>atau ketik manual</span></div>
-      <div class="field"><label for="connUrl">Alamat web</label><input id="connUrl" class="input" inputmode="url" autocomplete="off" spellcheck="false" placeholder="https://kosinyuk.id"></div>
-      <div class="field"><label for="connCode">Kode pairing (8 karakter)</label><input id="connCode" class="input" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="12" placeholder="K7Q2-M9XA"></div>
-      <div class="field"><label for="connName">Nama HP ini</label><input id="connName" class="input" maxlength="40" value="HP Setor"></div>
+      <div class="big" id="pairTitle" style="font-size:24px">Tambah bisnis</div>
+      <div class="field"><label for="bizName">Nama bisnis</label><input id="bizName" class="input" maxlength="40" placeholder="Contoh: Toko Bunga Mawar"></div>
+      <div class="row">
+        <div class="field"><label for="bandMin">3 digit terakhir dari</label><input id="bandMin" class="input" type="number" inputmode="numeric" min="1" max="999"></div>
+        <div class="field"><label for="bandMax">sampai</label><input id="bandMax" class="input" type="number" inputmode="numeric" min="1" max="999"></div>
+      </div>
+      <p class="hint" id="bandHint" aria-live="polite"></p>
+      <div id="connFields" class="stack">
+        <div class="divider"><span>hubungkan ke web (opsional)</span></div>
+        <button id="scanQr" class="btn primary" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 9V5a1 1 0 0 1 1-1h4M15 4h4a1 1 0 0 1 1 1v4M20 15v4a1 1 0 0 1-1 1h-4M9 20H5a1 1 0 0 1-1-1v-4M4 12h16"/></svg>Scan QR dari web usaha</button>
+        <p class="hint">Kosinyuk: Pengaturan → Hubungkan HP. Atmosphere: Admin → HP Kasir. Rentang di atas ikut dikirim, web menyesuaikan sendiri.</p>
+        <div class="field"><label for="connUrl">Alamat web</label><input id="connUrl" class="input" inputmode="url" autocomplete="off" spellcheck="false" placeholder="https://kosinyuk.id"></div>
+        <div class="field"><label for="connCode">Kode pairing (8 karakter)</label><input id="connCode" class="input" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="12" placeholder="K7Q2-M9XA"></div>
+        <div class="field"><label for="connName">Nama HP ini</label><input id="connName" class="input" maxlength="40" value="HP Setor"></div>
+        <button id="connPair" class="btn primary" type="button">Simpan & hubungkan</button>
+      </div>
       <div class="row">
         <button class="btn" value="cancel" formnovalidate>Batal</button>
-        <button id="connPair" class="btn primary" type="button">Hubungkan</button>
+        <button id="bizSave" class="btn" type="button">Simpan</button>
       </div>
     </form>
   </dialog>

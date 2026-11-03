@@ -9,8 +9,10 @@ Semua respons memakai bentuk `{ "success": true, "data": … }` atau `{ "success
 `POST {web}/api/devices/pair`
 
 ```json
-{ "code": "K7Q2M9XA", "name": "Samsung A15" }
+{ "code": "K7Q2M9XA", "name": "Samsung A15", "band": { "min": 500, "max": 999 } }
 ```
+
+`band` (opsional) = rentang 3 digit terakhir yang dipilih pemilik di Setor untuk bisnis ini. Web yang mendukung menyimpannya per bisnis dan membalas rentang yang dipakai; web lama mengabaikannya dan membalas rentangnya sendiri (Setor lalu ikut).
 
 Kode dibuat di halaman pengaturan web, 8 karakter, sekali pakai, berlaku 10 menit. Respons:
 
@@ -70,6 +72,23 @@ Satu HP bisa terhubung ke beberapa usaha sekaligus; setiap uang masuk dikirim ke
 ```
 
 Setor menampilkan `items` di kotak Notifikasi dengan tombol `action` (hanya URL https). Web tanpa endpoint ini (404) dilewati.
+
+## 5. Ubah rentang
+
+`POST {web}/api/devices/band` (Bearer) `{ "band": { "min": 600, "max": 999 } }` → `{ "band": { … } }` rentang yang dipakai.
+
+- Validasi: bilangan bulat 1–999, `min ≤ max`, minimal 10 angka.
+- Hanya tagihan **baru** yang memakai rentang baru; tagihan lama tetap cocok dengan nominalnya.
+- Di Setor, rentang lama tetap dikirim ke bisnis yang sama selama 45 hari (`prevBands`), supaya pembayaran tagihan lama tidak nyasar.
+- `404` = web lama dengan jalur tetap: Setor kembali ke rentang dari pairing.
+
+## 6. Riwayat (pasang ulang / HP baru)
+
+`POST {web}/api/devices/history` (Bearer), body `{}` → `{ "items": [{ "notifId", "amount", "time", "text", "result", "label" }] }`, pembayaran dari Setor ke bisnis ini selama 90 hari terakhir. Setor memanggilnya setelah pairing dan menggabungkan yang belum ada (berdasarkan `notifId`), jadi data yang sudah terkirim kembali walau HP direset.
+
+## 7. Laporan ganda dari dua HP
+
+Kalau dua HP Setor membaca DANA yang sama, `notifId` berbeda (waktu notifikasi tiap HP beda). Web menganggap laporan **dari perangkat lain** dengan nominal sama dalam ±2 menit sebagai `duplicate`.
 
 ## Belum ada
 

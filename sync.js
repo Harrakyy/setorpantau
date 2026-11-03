@@ -7,15 +7,66 @@ const BACKFILL_MS = 60 * 60 * 1000; // transaksi sampai 1 jam sebelum pairing ik
 export const inBand = (amount, band) => !band || (amount % 1000 >= band.min && amount % 1000 <= band.max);
 
 /**
- * Usaha tujuan satu uang masuk di antara beberapa web yang terhubung: yang jalurnya cocok,
- * kalau tidak ada, web lama tanpa jalur (Atmosphere) yang pertama, kalau tidak ada juga: null (tetap di HP).
+ * Bisnis tujuan satu uang masuk. Bisnis = { id, business, band, prevBands?, url?, token? }; tanpa url = bisnis
+ * yang hanya dicatat di HP (mis. "Toko Bunga"). Urutan: jalur sekarang, lalu jalur lama yang masih berlaku
+ * (tagihan lama dibuat sebelum rentang diubah), lalu web lama tanpa jalur, kalau tidak ada: null (Di HP saja).
  */
 export const targetConn = (t, conns) =>
-  conns.find((c) => c.band && inBand(t.amount, c.band)) ?? conns.find((c) => !c.band) ?? null;
+  conns.find((c) => c.band && inBand(t.amount, c.band)) ??
+  conns.find((c) => (c.prevBands ?? []).some((b) => b.until >= t.time && inBand(t.amount, b))) ??
+  conns.find((c) => !c.band && c.url) ??
+  null;
+
+export const keyOf = (c) => c.id ?? c.url;
+
+const OLD_BAND_MS = 45 * 24 * 60 * 60 * 1000; // tagihan bulanan + telat: jalur lama tetap dikenali 45 hari
+
+/** Ganti rentang: rentang lama disimpan sebagai jalur lama supaya tagihan yang sudah dikirim tetap terkirim ke bisnis ini. */
+export function withBand(c, band, now = Date.now()) {
+  const same = c.band && c.band.min === band.min && c.band.max === band.max;
+  if (same) return c;
+  const prev = [...(c.prevBands ?? []).filter((b) => b.until >= now), ...(c.band ? [{ ...c.band, until: now + OLD_BAND_MS }] : [])];
+  return { ...c, band, prevBands: prev, bandSynced: false };
+}
+
+/** Rentang tabrakan dengan bisnis lain? Mengembalikan bisnis yang bentrok, atau null. */
+export const bandConflict = (band, conns, exceptKey) =>
+  conns.find((c) => keyOf(c) !== exceptKey && c.band && band.min <= c.band.max && c.band.min <= band.max) ?? null;
+
+/** Rentang bawaan bisnis baru: celah kosong terlebar di 001–999. null kalau sudah penuh. */
+export function freeRange(conns, exceptKey) {
+  const used = conns.filter((c) => keyOf(c) !== exceptKey && c.band).map((c) => c.band).sort((a, b) => a.min - b.min);
+  let best = null;
+  let from = 1;
+  for (const b of [...used, { min: 1000, max: 1000 }]) {
+    if (b.min > from && (!best || b.min - from > best.max - best.min + 1)) best = { min: from, max: b.min - 1 };
+    from = Math.max(from, b.max + 1);
+  }
+  return best;
+}
+
+/** Valid: 3 digit (001–999), min ≤ max, minimal 10 angka supaya muat beberapa tagihan menunggu. */
+export const validBand = (b) => Number.isInteger(b?.min) && Number.isInteger(b?.max) && b.min >= 1 && b.max <= 999 && b.max - b.min >= 9;
+
+/** Riwayat pembayaran dari web (Protokol Setor §6) → transaksi Setor yang sudah terkirim, untuk pasang ulang / HP baru. */
+export const fromHistory = (items, url, now = Date.now()) =>
+  items
+    .filter((i) => typeof i?.notifId === "string" && Number.isInteger(i.amount) && i.amount > 0 && Number.isFinite(i.time))
+    .map((i) => ({
+      id: i.notifId,
+      amount: i.amount,
+      time: i.time,
+      title: "",
+      text: typeof i.text === "string" ? i.text : "",
+      pkg: i.notifId.split("|")[0],
+      note: "",
+      label: typeof i.label === "string" ? i.label : "",
+      sync: { state: "sent", result: i.result ?? "matched", label: i.label ?? null, to: url, at: now },
+    }));
 
 /** Transaksi yang perlu dikirim ke `conn`, terlama dulu supaya urutan di server sesuai kejadian. */
 export function pendingTx(list, conn, conns = [conn]) {
-  if (!conn) return [];
+  if (!conn?.url) return [];
   return list
     .filter((t) => t.time >= conn.pairedAt - BACKFILL_MS && targetConn(t, conns) === conn && t.sync?.state !== "sent" && t.sync?.state !== "failed")
     .sort((a, b) => a.time - b.time);
@@ -94,6 +145,7 @@ export function notifCopy(t, connOrConns) {
   if (!conns.length) return { title: masuk, text: "DANA · tercatat di HP" };
   const conn = conns.find((c) => c.url === s?.to) ?? targetConn(t, conns);
   const business = conn?.business ?? "web usaha";
+  if (conn && !conn.url) return { title: masuk, text: `${business} · tercatat di HP` };
   if (s?.state === "sent") {
     const already = s.result === "duplicate" || s.result === "ALREADY_PAID";
     if (/^matched$/i.test(s.result ?? "") || (already && s.label)) {
@@ -109,11 +161,12 @@ export function notifCopy(t, connOrConns) {
 
 /** Ringkasan bulan ini per usaha (untuk layar Ringkasan): jumlah & total per tujuan, sisanya "Di HP saja". */
 export function perBusiness(list, conns, month) {
-  const groups = new Map(conns.map((c) => [c.url, { key: c.url, name: c.business ?? new URL(c.url).host, sum: 0, count: 0 }]));
+  const groups = new Map(conns.map((c) => [keyOf(c), { key: keyOf(c), name: c.business ?? new URL(c.url).host, sum: 0, count: 0 }]));
   const local = { key: "local", name: "Di HP saja", sum: 0, count: 0 };
   for (const t of list) {
     if (!month(t.time)) continue;
-    const g = groups.get(t.sync?.state === "sent" ? t.sync.to : targetConn(t, conns)?.url) ?? local;
+    const to = t.sync?.state === "sent" ? conns.find((c) => c.url === t.sync.to) : targetConn(t, conns);
+    const g = (to && groups.get(keyOf(to))) ?? local;
     g.sum += t.amount;
     g.count += 1;
   }

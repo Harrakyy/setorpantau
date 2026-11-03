@@ -5,7 +5,7 @@ import { Share } from "@capacitor/share";
 import { BarcodeScanner, BarcodeFormat } from "@capacitor-mlkit/barcode-scanning";
 import { NotificationsListener } from "capacitor-notifications-listener";
 import { parseNotification, addTx, updateTx, deleteTx, totals, filterTx, toCsv, wibDate, toBackup, fromBackup } from "../core.js";
-import { pendingTx, syncAll, mergeSynced, normalizeServerUrl, notifCopy, targetConn, perBusiness, parsePairQr } from "../sync.js";
+import { pendingTx, syncAll, mergeSynced, normalizeServerUrl, notifCopy, targetConn, perBusiness, parsePairQr, keyOf, withBand, bandConflict, freeRange, validBand, fromHistory } from "../sync.js";
 
 // Plugin lokal (android/.../SetorPlugin.java): notifikasi khusus Setor + cek kesehatan HP
 const SetorNative = registerPlugin("Setor");
@@ -17,6 +17,7 @@ const KEY_CONNS = "setorpantau.conns"; // [{ url, token, deviceName, business, b
 const KEY_CONN_OLD = "setorpantau.conn"; // versi satu usaha, dipindah ke KEY_CONNS
 const KEY_EVENTS = "setorpantau.events";
 const KEY_OB = "setorpantau.onboarded";
+const KEY_BAK = "setorpantau.backup"; // { day, file, at } cadangan otomatis harian terakhir
 const DEFAULT_PKGS = ["id.dana"];
 
 const $ = (id) => document.getElementById(id);
@@ -30,7 +31,7 @@ const fmtShort = (ms) =>
   new Date(ms).toLocaleString("id-ID", { timeZone: "Asia/Jakarta", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
 const monthName = () => new Date().toLocaleString("id-ID", { timeZone: "Asia/Jakarta", month: "long" });
 const thisMonth = (ms) => wibDate(ms).slice(0, 7) === wibDate(Date.now()).slice(0, 7);
-const nameOf = (c) => c.business ?? new URL(c.url).host;
+const nameOf = (c) => c.business || new URL(c.url).host;
 const initials = (s) => s.split(/[\s·]+/).filter(Boolean).slice(0, 2).map((w) => w[0]).join("").toUpperCase() || "?";
 const bandText = (b) => (b ? `${String(b.min).padStart(3, "0")}–${b.max}` : "Semua");
 
@@ -53,6 +54,7 @@ async function load() {
     packages = rawPkgs ? JSON.parse(rawPkgs) : DEFAULT_PKGS;
     events = rawEv ? JSON.parse(rawEv) : [];
     conns = rawConns ? JSON.parse(rawConns) : rawOld ? [JSON.parse(rawOld)] : [];
+    conns = conns.map((c) => ({ ...c, id: keyOf(c) })); // versi lama: kunci = alamat web
     if (!rawConns && rawOld) {
       await saveConns();
       await Preferences.remove({ key: KEY_CONN_OLD });
@@ -79,7 +81,15 @@ const notify = (t) => isNative && SetorNative.notify({ key: t.id, ...notifCopy(t
 // ---------- notifikasi masuk ----------
 async function onNotification(n) {
   const tx = parseNotification(n, packages);
-  if (!tx) return;
+  if (!tx) {
+    // Notif dari DANA yang menyebut uang tapi tidak terbaca: kemungkinan kalimat DANA berubah, jangan diam saja
+    const text = `${n?.title ?? ""} ${n?.text ?? ""}`;
+    if (packages.includes(n?.package) && /Rp\s?[\d.]+/.test(text) && /masuk|terima/i.test(text)) {
+      addEvent({ id: `unk:${n.package}|${n.time}`, kind: "act", who: "Setor", title: "Notif uang masuk tidak terbaca", detail: `"${text.trim().slice(0, 140)}". Cek di aplikasi DANA dan laporkan ke kami supaya Setor diperbarui.` });
+      renderInbox();
+    }
+    return;
+  }
   const before = txs.length;
   txs = addTx(txs, tx);
   if (txs.length === before) return; // sudah tercatat (notif dikirim ulang dari cache)
@@ -120,7 +130,7 @@ function recordResult(t) {
 }
 
 async function removeConn(c, why) {
-  conns = conns.filter((x) => x.url !== c.url);
+  conns = conns.filter((x) => keyOf(x) !== keyOf(c));
   delete reminders[c.url];
   await saveConns();
   if (why) addEvent({ id: `revoked:${c.url}:${Date.now()}`, kind: "act", who: nameOf(c), title: "Akses HP ini dicabut", detail: why });
@@ -155,7 +165,8 @@ async function syncNow() {
 // Protokol Setor §4: tagihan belum lunas per usaha (Kosinyuk). Web tanpa endpoint ini (Atmosphere lama) dilewati.
 let lastReminderCount = -1;
 async function refreshSummaries() {
-  for (const c of [...conns]) {
+  await syncBands();
+  for (const c of conns.filter((x) => x.url)) {
     try {
       const res = await postJson(`${c.url}/api/devices/summary`, {}, c.token);
       if (res.status === 401) {
@@ -179,13 +190,59 @@ async function refreshSummaries() {
   render();
 }
 
-// ---------- hubungkan usaha ----------
-function openPair(prefill) {
+// ---------- bisnis: tambah/ubah + hubungkan ke web ----------
+let editingBiz = null; // kunci bisnis yang diubah; null = bisnis baru
+
+const sheetBand = () => ({ min: Number($("bandMin").value), max: Number($("bandMax").value) });
+const pad3 = (n) => String(n).padStart(3, "0");
+
+function bandHint() {
+  const b = sheetBand();
+  const hint = $("bandHint");
+  if (!validBand(b)) return (hint.textContent = "Isi angka 001–999, minimal 10 angka (misalnya 200 sampai 349).");
+  const clash = bandConflict(b, conns, editingBiz);
+  if (clash) return (hint.textContent = `⚠️ Bertabrakan dengan ${nameOf(clash)} (${bandText(clash.band)}).`);
+  const width = b.max - b.min + 1;
+  hint.textContent = `Muat ±${width} pembayaran menunggu sekaligus. Kode unik bisa sampai Rp${1000 - width}.`;
+}
+
+function openPair(c, prefill) {
+  editingBiz = c ? keyOf(c) : null;
+  const band = c?.band ?? freeRange(conns) ?? { min: 1, max: 999 };
+  $("pairTitle").textContent = c ? `Ubah ${nameOf(c)}` : "Tambah bisnis";
+  $("bizName").value = c?.business ?? "";
+  $("bandMin").value = pad3(band.min);
+  $("bandMax").value = band.max;
+  $("connFields").classList.toggle("hidden", !!c?.url);
   if (prefill) {
     $("connUrl").value = prefill.url;
     $("connCode").value = prefill.code;
   }
+  bandHint();
   $("pairSheet").showModal();
+}
+
+/** Validasi isi lembar; null kalau belum benar (pesan sudah ditampilkan). */
+function readSheet() {
+  const band = sheetBand();
+  if (!validBand(band)) return toast("Rentang tidak valid: 001–999, minimal 10 angka."), null;
+  const clash = bandConflict(band, conns, editingBiz);
+  if (clash) return toast(`Rentang bertabrakan dengan ${nameOf(clash)}.`), null;
+  return { band, name: $("bizName").value.trim().slice(0, 40) };
+}
+
+async function saveBiz() {
+  const f = readSheet();
+  if (!f) return;
+  const old = conns.find((c) => keyOf(c) === editingBiz);
+  if (!old && !f.name) return toast("Isi nama bisnis.");
+  const next = old ? { ...withBand(old, f.band), business: f.name || old.business } : { id: `biz-${Date.now()}`, business: f.name, band: f.band };
+  conns = old ? conns.map((c) => (keyOf(c) === editingBiz ? next : c)) : [...conns, next];
+  await saveConns();
+  $("pairSheet").close();
+  toast(old ? "Bisnis diperbarui" : `${f.name} ditambahkan`);
+  render();
+  syncBands();
 }
 
 async function scanQr() {
@@ -208,6 +265,8 @@ async function scanQr() {
 }
 
 async function pair() {
+  const f = readSheet();
+  if (!f) return;
   let url;
   try {
     url = normalizeServerUrl($("connUrl").value);
@@ -219,19 +278,42 @@ async function pair() {
   if (code.length < 8) return toast("Isi kode pairing 8 karakter dari web usaha.");
   $("connPair").disabled = true;
   try {
-    const res = await postJson(`${url}/api/devices/pair`, { code, name: $("connName").value.trim() || "HP Setor" });
+    // Protokol Setor §1: rentang pilihan pemilik ikut dikirim; web baru memakainya, web lama membalas rentangnya sendiri
+    const res = await postJson(`${url}/api/devices/pair`, { code, name: $("connName").value.trim() || "HP Setor", band: f.band });
     if (!res.data?.success) return toast(res.data?.error?.message || res.data?.message || "Gagal menghubungkan. Cek alamat web.");
-    // band: jalur 3 digit usaha ini (Kosinyuk 500–999); web lama tanpa band menerima semua nominal
     const d = res.data.data;
-    const c = { url, token: d.token, deviceName: d.device.name, business: d.business?.name ?? null, band: d.band ?? null, dashboard: d.dashboard ?? null, pairedAt: Date.now() };
-    conns = [...conns.filter((x) => x.url !== url), c];
+    const old = conns.find((c) => keyOf(c) === editingBiz) ?? {};
+    const band = d.band ?? null;
+    const c = {
+      ...old,
+      id: old.id ?? `biz-${Date.now()}`,
+      url,
+      token: d.token,
+      deviceName: d.device.name,
+      business: f.name || d.business?.name || null,
+      band,
+      webBand: band,
+      bandSynced: true,
+      dashboard: d.dashboard ?? null,
+      pairedAt: Date.now(),
+    };
+    conns = [...conns.filter((x) => keyOf(x) !== keyOf(c) && x.url !== url), c];
     await saveConns();
     $("connCode").value = "";
     $("pairSheet").close();
-    addEvent({ id: `pair:${url}:${c.pairedAt}`, kind: "ok", who: nameOf(c), title: "Terhubung", detail: `Jalur ${bandText(c.band)} dikirim ke ${nameOf(c)}.` });
+    const fixed = band && (band.min !== f.band.min || band.max !== f.band.max);
+    const clash = band && bandConflict(band, conns, keyOf(c));
+    addEvent({
+      id: `pair:${url}:${c.pairedAt}`,
+      kind: clash ? "act" : "ok",
+      who: nameOf(c),
+      title: "Terhubung",
+      detail: fixed ? `Web ini memakai jalur tetap ${bandText(band)}${clash ? `, bertabrakan dengan ${nameOf(clash)}: ubah rentang ${nameOf(clash)}` : ""}.` : `Jalur ${bandText(band)} dipakai ${nameOf(c)}.`,
+    });
     toast(`Terhubung ke ${nameOf(c)}`);
     setTab("usaha");
     render();
+    pullHistory(c);
     syncNow();
     refreshSummaries();
   } catch {
@@ -239,6 +321,36 @@ async function pair() {
   } finally {
     $("connPair").disabled = false;
   }
+}
+
+/** Protokol Setor §5: kirim rentang yang diubah pemilik ke web. Web lama (404) tetap di jalurnya: Setor ikut. */
+async function syncBands() {
+  for (const c of conns.filter((x) => x.url && x.bandSynced === false)) {
+    try {
+      const res = await postJson(`${c.url}/api/devices/band`, { band: c.band }, c.token);
+      if (res.status === 401) continue; // ditangani ringkasan/sinkron
+      const ok = res.data?.success;
+      const band = ok ? res.data.data.band : c.webBand;
+      conns = conns.map((x) => (keyOf(x) === keyOf(c) ? { ...(band ? withBand(x, band) : x), bandSynced: true, webBand: band } : x));
+      if (!ok && res.status === 404) addEvent({ id: `band:${keyOf(c)}:${Date.now()}`, kind: "act", who: nameOf(c), title: "Rentang tidak bisa diubah", detail: `Web ini memakai jalur tetap ${bandText(band)}.` });
+      await saveConns();
+    } catch {} // offline: dicoba lagi berikutnya
+  }
+  render();
+}
+
+/** Protokol Setor §6: setelah pasang ulang / HP baru, ambil lagi pembayaran yang dulu dikirim ke web ini. */
+async function pullHistory(c) {
+  try {
+    const res = await postJson(`${c.url}/api/devices/history`, {}, c.token);
+    if (!res.data?.success) return;
+    const before = txs.length;
+    txs = fromHistory(res.data.data.items ?? [], c.url).reduce(addTx, txs);
+    if (txs.length === before) return;
+    await saveTxs();
+    render();
+    toast(`${txs.length - before} transaksi lama diambil dari ${nameOf(c)}`);
+  } catch {}
 }
 
 // ---------- status kirim ----------
@@ -410,7 +522,7 @@ function render() {
 
 function renderHomeUsaha(groups) {
   const rows = conns.map((c) => {
-    const g = groups.find((x) => x.key === c.url);
+    const g = groups.find((x) => x.key === keyOf(c));
     const b = el("button", "glass");
     b.type = "button";
     b.innerHTML = `<span class="gi"></span><span class="gt"><b></b><span></span></span>`;
@@ -423,7 +535,7 @@ function renderHomeUsaha(groups) {
   if (!conns.length) {
     const b = el("button", "glass");
     b.type = "button";
-    b.innerHTML = `<span class="gi">+</span><span class="gt"><b>Belum terhubung ke web usaha</b><span>Ketuk untuk menghubungkan, misalnya ke Kosinyuk</span></span>`;
+    b.innerHTML = `<span class="gi">+</span><span class="gt"><b>Belum ada bisnis</b><span>Ketuk untuk menambah bisnis & rentang nominalnya</span></span>`;
     b.addEventListener("click", () => openPair());
     rows.push(b);
   }
@@ -444,48 +556,49 @@ function renderReminder() {
 }
 
 function renderUsaha(groups) {
+  const button = (text, cls, fn) => {
+    const b = el("button", cls, text);
+    b.type = "button";
+    b.addEventListener("click", fn);
+    return b;
+  };
   const cards = conns.map((c) => {
-    const g = groups.find((x) => x.key === c.url);
+    const g = groups.find((x) => x.key === keyOf(c));
     const queued = pendingTx(txs, c, conns).length;
     const failed = txs.filter((t) => t.sync?.state === "failed" && targetConn(t, conns) === c).length;
     const card = el("div", "ucard");
     card.innerHTML = `<div class="uhead"><span class="ui"></span><span class="un"><b></b><span></span></span></div>
-      <div class="ustats"><div><span>Bulan ini</span><b class="s1"></b></div><div><span>Transaksi</span><b class="s2"></b></div><div><span>Antri</span><b class="s3"></b></div></div>
+      <div class="ustats"><div><span>Bulan ini</span><b class="s1"></b></div><div><span>Transaksi</span><b class="s2"></b></div><div><span>${c.url ? "Antri" : "Web"}</span><b class="s3"></b></div></div>
       <div class="row"></div>`;
     card.querySelector(".ui").textContent = initials(nameOf(c));
     card.querySelector(".un b").textContent = nameOf(c);
-    card.querySelector(".un span").textContent = `${new URL(c.url).host} · jalur ${bandText(c.band)} · "${c.deviceName}"`;
+    card.querySelector(".un span").textContent = c.url
+      ? `${new URL(c.url).host} · jalur ${bandText(c.band)}${c.bandSynced === false ? " (menunggu dikirim)" : ""} · "${c.deviceName}"`
+      : `Jalur ${bandText(c.band)} · dicatat di HP saja`;
     card.querySelector(".s1").textContent = rupiah(g?.sum ?? 0);
     card.querySelector(".s2").textContent = String(g?.count ?? 0);
-    card.querySelector(".s3").textContent = String(queued + failed);
+    card.querySelector(".s3").textContent = c.url ? String(queued + failed) : "—";
     const row = card.querySelector(".row");
-    row.append(linkBtn("Buka dashboard", c.dashboard || c.url, "btn primary"));
+    if (c.url) row.append(linkBtn("Buka dashboard", c.dashboard || c.url, "btn primary"));
+    else row.append(button("Hubungkan ke web", "btn primary", () => openPair(c)));
+    row.append(button("Ubah rentang", "btn", () => openPair(c)));
     if (failed) {
-      const retry = el("button", "btn", `Kirim ulang ${failed} yang gagal`);
-      retry.type = "button";
-      retry.addEventListener("click", async () => {
+      row.append(button(`Kirim ulang ${failed} yang gagal`, "btn", async () => {
         txs = txs.map((t) => (t.sync?.state === "failed" && targetConn(t, conns) === c ? { ...t, sync: undefined } : t));
         await syncNow();
-      });
-      row.append(retry);
+      }));
     }
-    const off = el("button", "btn danger", "Putuskan");
-    off.type = "button";
-    off.addEventListener("click", async () => {
-      if (!confirm(`Putuskan HP ini dari ${nameOf(c)}? Pembayaran tidak lagi dikirim ke sana.`)) return;
+    row.append(button(c.url ? "Putuskan" : "Hapus", "btn danger", async () => {
+      if (!confirm(c.url ? `Putuskan HP ini dari ${nameOf(c)}? Pembayaran tidak lagi dikirim ke sana.` : `Hapus ${nameOf(c)}? Transaksinya tetap tersimpan.`)) return;
       await removeConn(c);
       render();
-    });
-    row.append(off);
+    }));
     return card;
   });
   if (!conns.length) {
     const empty = el("div", "card");
-    empty.innerHTML = `<h3>Belum ada usaha</h3><p>Buka web usahamu (Kosinyuk: Pengaturan → Hubungkan HP), lalu scan QR-nya dari sini.</p>`;
-    const go = el("button", "btn primary", "Hubungkan usaha");
-    go.type = "button";
-    go.addEventListener("click", () => openPair());
-    empty.append(go);
+    empty.innerHTML = `<h3>Belum ada bisnis</h3><p>Tambah bisnismu (nama bebas, misalnya "Toko Bunga") dan rentang 3 digit terakhirnya. Punya web seperti Kosinyuk? Sekalian scan QR-nya.</p>`;
+    empty.append(button("Tambah bisnis", "btn primary", () => openPair()));
     cards.push(empty);
   }
   $("usahaList").replaceChildren(...cards);
@@ -495,8 +608,9 @@ function renderUsaha(groups) {
     r.append(el("b", null, bandText(c.band)), el("span", null, nameOf(c)));
     return r;
   });
+  const gap = freeRange(conns);
   const rest = el("div", "jrow");
-  rest.append(el("b", null, conns.some((c) => !c.band) ? "—" : "Lainnya"), el("span", null, conns.some((c) => !c.band) ? "Semua nominal sudah punya tujuan" : "Disimpan di HP saja"));
+  rest.append(el("b", null, gap ? "Sisanya" : "—"), el("span", null, gap ? `Disimpan di HP saja (mis. ${bandText(gap)})` : "Semua angka sudah punya bisnis"));
   $("jalurList").replaceChildren(...jalur, rest);
 }
 
@@ -609,7 +723,7 @@ function openDetail(id) {
   $("detailSync").classList.toggle("hidden", !sc);
   if (sc) $("detailSync").textContent = `Web: ${sc[0]}${t.sync?.label ? " · " + t.sync.label : ""}${t.sync?.error ? " · " + t.sync.error : ""}`;
   // Nominal di luar jalur tidak dikirim otomatis; pemilik bisa meneruskannya sendiri (mis. bayar bulat tanpa kode unik)
-  const fwd = t.sync?.state !== "sent" && !targetConn(t, conns) ? conns : [];
+  const fwd = t.sync?.state !== "sent" && !targetConn(t, conns)?.url ? conns.filter((c) => c.url) : [];
   $("detailForward").replaceChildren(...fwd.map((c) => {
     const b = el("button", "btn primary", `Teruskan ke ${nameOf(c)}`);
     b.type = "button";
@@ -678,22 +792,42 @@ async function saveFile(name, data, type) {
   }
 }
 
-$("backupSave").addEventListener("click", async () => {
-  if (!txs.length) return toast("Belum ada transaksi untuk dicadangkan.");
-  try {
-    await saveFile(`Setor-cadangan-${wibDate(Date.now())}.json`, toBackup(txs, packages), "application/json");
-  } catch (err) {
-    if (!/cancel/i.test(String(err?.message))) toast("Gagal menyimpan cadangan.");
-  }
-});
+// Cadangan otomatis harian di Documents/Setor (di luar data app, jadi selamat saat uninstall).
+// Ditulis sekali per hari saat app dibuka = kondisi sampai kemarin; file yang sama ditimpa, jadi hanya satu yang tersimpan.
+const BAK_DIR = "Setor";
+const readBak = async () => JSON.parse((await Preferences.get({ key: KEY_BAK })).value ?? "null");
 
-$("backupFile").addEventListener("change", async (e) => {
-  const file = e.target.files?.[0];
-  e.target.value = "";
-  if (!file) return;
+async function autoBackup() {
+  if (!isNative || !txs.length) return;
+  const day = wibDate(Date.now());
+  const bak = await readBak();
+  if (bak?.day === day) return;
+  const write = (file) => Filesystem.writeFile({ path: `${BAK_DIR}/${file}`, data: toBackup(txs, packages), directory: Directory.Documents, encoding: Encoding.UTF8, recursive: true });
+  let file = bak?.file ?? "Setor-cadangan.json";
+  try {
+    await Filesystem.requestPermissions().catch(() => {}); // hanya diminta di Android 10 ke bawah
+    await write(file);
+  } catch {
+    // File dari pemasangan sebelumnya bukan milik app ini lagi (Android 11+): tulis ke nama baru
+    file = `Setor-cadangan-${Date.now().toString(36)}.json`;
+    try { await write(file); } catch { return renderBackupInfo(null); }
+  }
+  const next = { day, file, at: Date.now(), count: txs.length };
+  await Preferences.set({ key: KEY_BAK, value: JSON.stringify(next) });
+  renderBackupInfo(next);
+}
+
+function renderBackupInfo(bak) {
+  $("autoBakInfo").className = `notice ${bak ? "ok" : "warn"}`;
+  $("autoBakInfo").textContent = bak
+    ? `Cadangan otomatis terakhir: ${fmtWhen(bak.at)} · ${bak.count} transaksi · Documents/${BAK_DIR}/${bak.file}`
+    : isNative ? "Cadangan otomatis belum ada (dibuat saat ada transaksi)." : "Cadangan otomatis hanya di aplikasi Android.";
+}
+
+async function restoreData(text) {
   let data;
   try {
-    data = fromBackup(await file.text());
+    data = fromBackup(text);
   } catch (err) {
     return toast(err.message?.startsWith("Bukan") ? err.message : "File cadangan rusak.");
   }
@@ -708,6 +842,34 @@ $("backupFile").addEventListener("change", async (e) => {
   await saveTxs();
   render();
   toast(`${txs.length - before} transaksi dipulihkan`);
+}
+
+$("backupLast").addEventListener("click", async () => {
+  const bak = await readBak();
+  if (isNative && bak) {
+    try {
+      const r = await Filesystem.readFile({ path: `${BAK_DIR}/${bak.file}`, directory: Directory.Documents, encoding: Encoding.UTF8 });
+      return restoreData(r.data);
+    } catch {} // jatuh ke pemilih file
+  }
+  // Setelah pasang ulang, Android hanya mengizinkan membuka file lama lewat pemilih file
+  toast(`Pilih file Setor-cadangan… di folder Documents/${BAK_DIR}`);
+  $("backupFile").click();
+});
+
+$("backupSave").addEventListener("click", async () => {
+  if (!txs.length) return toast("Belum ada transaksi untuk dicadangkan.");
+  try {
+    await saveFile(`Setor-cadangan-${wibDate(Date.now())}.json`, toBackup(txs, packages), "application/json");
+  } catch (err) {
+    if (!/cancel/i.test(String(err?.message))) toast("Gagal menyimpan cadangan.");
+  }
+});
+
+$("backupFile").addEventListener("change", async (e) => {
+  const file = e.target.files?.[0];
+  e.target.value = "";
+  if (file) restoreData(await file.text());
 });
 
 // ---------- izin & sumber ----------
@@ -823,6 +985,8 @@ $("hBatteryBtn").addEventListener("click", openBattery);
 $("hAccessBtn").addEventListener("click", requestPermission);
 $("grant").addEventListener("click", requestPermission);
 for (const id of ["goConnect", "addUsaha"]) $(id).addEventListener("click", () => openPair());
+for (const id of ["bandMin", "bandMax"]) $(id).addEventListener("input", bandHint);
+$("bizSave").addEventListener("click", saveBiz);
 $("scanQr").addEventListener("click", scanQr);
 $("connPair").addEventListener("click", pair);
 $("openInbox").addEventListener("click", () => setTab("inbox"));
@@ -856,6 +1020,7 @@ document.addEventListener("visibilitychange", async () => {
   }
   syncNow();
   refreshSummaries();
+  autoBackup();
 });
 
 // Selama aplikasi terbuka: kirim ulang antrian tiap menit (mis. internet kembali), pengingat tiap 10 menit
@@ -883,4 +1048,6 @@ setInterval(() => document.visibilityState === "visible" && refreshSummaries(), 
   await refreshPermission();
   syncNow();
   refreshSummaries();
+  renderBackupInfo(await readBak());
+  autoBackup();
 })();

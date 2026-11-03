@@ -38,9 +38,18 @@ public class SetorNotifierTest {
     @Test
     public void target_samaDenganSyncJs() throws Exception {
         JSONArray conns = new JSONArray("[{\"url\":\"https://atm\"},{\"url\":\"https://kos\",\"band\":{\"min\":500,\"max\":999}}]");
-        assertEquals("https://kos", SetorNotifier.target(conns, 800512).optString("url"));
-        assertEquals("https://atm", SetorNotifier.target(conns, 35017).optString("url"));
+        assertEquals("https://kos", SetorNotifier.target(conns, 800512, 0).optString("url"));
+        assertEquals("https://atm", SetorNotifier.target(conns, 35017, 0).optString("url"));
         JSONArray kosOnly = new JSONArray("[{\"url\":\"https://kos\",\"band\":{\"min\":500,\"max\":999}}]");
-        assertEquals(null, SetorNotifier.target(kosOnly, 35017));
+        assertEquals(null, SetorNotifier.target(kosOnly, 35017, 0));
+    }
+
+    @Test
+    public void target_jalurLamaDanBisnisTanpaWeb() throws Exception {
+        JSONArray conns = new JSONArray("[{\"id\":\"b\",\"business\":\"Toko Bunga\",\"band\":{\"min\":200,\"max\":349}},"
+                + "{\"url\":\"https://kos\",\"band\":{\"min\":600,\"max\":999},\"prevBands\":[{\"min\":500,\"max\":999,\"until\":100}]}]");
+        assertEquals("Toko Bunga", SetorNotifier.target(conns, 75250, 0).optString("business"));
+        assertEquals("https://kos", SetorNotifier.target(conns, 799512, 50).optString("url"));
+        assertEquals(null, SetorNotifier.target(conns, 799512, 200)); // jalur lama sudah kedaluwarsa
     }
 }

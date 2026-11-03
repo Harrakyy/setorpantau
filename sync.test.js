@@ -140,3 +140,41 @@ test("parsePairQr: QR Kosinyuk → alamat + kode; QR lain ditolak", async () => 
   assert.equal(parsePairQr("http://kosinyuk.id/setor/pair?c=K7Q2M9XA"), null); // bukan https
   assert.equal(parsePairQr("https://kosinyuk.id/"), null);
 });
+
+test("bisnis bebas: rentang otomatis, tabrakan ditolak, bisnis tanpa web dicatat di HP", async () => {
+  const { freeRange, bandConflict, validBand, targetConn, notifCopy, perBusiness } = await import("./sync.js");
+  const kos = { id: "kos", url: "https://kosinyuk.id", business: "Kos Melati", band: { min: 500, max: 999 } };
+  assert.deepEqual(freeRange([kos]), { min: 1, max: 499 });
+  const bunga = { id: "b", business: "Toko Bunga", band: { min: 200, max: 349 } };
+  assert.deepEqual(freeRange([kos, bunga]), { min: 1, max: 199 });
+  assert.deepEqual(freeRange([kos, bunga], "b"), { min: 1, max: 499 }); // saat mengedit dirinya sendiri
+  assert.equal(freeRange([{ id: "x", band: { min: 1, max: 999 } }]), null);
+  assert.equal(bandConflict({ min: 300, max: 400 }, [kos, bunga]), bunga);
+  assert.equal(bandConflict({ min: 350, max: 499 }, [kos, bunga]), null);
+  assert.equal(validBand({ min: 5, max: 9 }), false);
+  const t = tx("f", 1, { amount: 75250 });
+  assert.equal(targetConn(t, [kos, bunga]), bunga);
+  assert.equal(notifCopy(t, [kos, bunga]).text, "Toko Bunga · tercatat di HP");
+  assert.deepEqual(pendingTx([t], bunga, [kos, bunga]), []); // tidak punya web: tidak ada yang dikirim
+  assert.deepEqual(perBusiness([t], [kos, bunga], () => true).map((g) => g.name), ["Toko Bunga"]);
+});
+
+test("rentang diubah: tagihan lama di rentang lama tetap ke bisnis yang sama selama 45 hari", async () => {
+  const { withBand, targetConn } = await import("./sync.js");
+  const NOW = 1_800_000_000_000;
+  const kos = withBand({ id: "kos", url: "https://kosinyuk.id", band: { min: 500, max: 999 } }, { min: 600, max: 999 }, NOW);
+  assert.equal(kos.bandSynced, false);
+  const cafe = { id: "c", url: "https://atm.id", band: { min: 100, max: 499 } };
+  assert.equal(targetConn(tx("old", 0, { amount: 799512, time: NOW + 1000 }), [kos, cafe]), kos);
+  assert.equal(targetConn(tx("late", 0, { amount: 799512, time: NOW + 46 * 86_400_000 }), [kos, cafe]), null);
+  assert.equal(targetConn(tx("new", 0, { amount: 799612, time: NOW }), [kos, cafe]), kos);
+});
+
+test("fromHistory: riwayat dari web jadi transaksi terkirim yang tidak dobel", async () => {
+  const { fromHistory } = await import("./sync.js");
+  const { addTx } = await import("./core.js");
+  const [h] = fromHistory([{ notifId: "id.dana|5|Rp1.000 diterima", amount: 1000, time: 5, text: "Rp1.000 diterima", result: "matched", label: "K3 · Budi" }, { notifId: 1 }], "https://kosinyuk.id");
+  assert.equal(h.sync.state, "sent");
+  assert.equal(h.label, "K3 · Budi");
+  assert.equal([h].reduce(addTx, [{ ...h, note: "catatan lokal" }]).length, 1);
+});

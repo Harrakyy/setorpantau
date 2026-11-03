@@ -62,20 +62,25 @@ final class SetorNotifier {
         return last3 >= min && last3 <= max;
     }
 
-    /** Sama dengan targetConn di sync.js: usaha yang jalurnya cocok, lalu web tanpa jalur, atau null (tetap di HP). */
-    static JSONObject target(JSONArray conns, long amount) {
-        JSONObject fallback = null;
+    /**
+     * Sama dengan targetConn di sync.js: jalur sekarang, lalu jalur lama yang masih berlaku (prevBands, sampai `until`),
+     * lalu web lama tanpa jalur, atau null (tetap di HP). Bisnis tanpa url = hanya dicatat di HP.
+     */
+    static JSONObject target(JSONArray conns, long amount, long time) {
+        JSONObject old = null, fallback = null;
         for (int i = 0; conns != null && i < conns.length(); i++) {
             JSONObject c = conns.optJSONObject(i);
             if (c == null) continue;
             JSONObject band = c.optJSONObject("band");
-            if (band == null) {
-                if (fallback == null) fallback = c;
-            } else if (inBand(amount, band.optInt("min"), band.optInt("max"))) {
-                return c;
+            if (band != null && inBand(amount, band.optInt("min"), band.optInt("max"))) return c;
+            JSONArray prev = c.optJSONArray("prevBands");
+            for (int j = 0; old == null && prev != null && j < prev.length(); j++) {
+                JSONObject b = prev.optJSONObject(j);
+                if (b != null && b.optLong("until") >= time && inBand(amount, b.optInt("min"), b.optInt("max"))) old = c;
             }
+            if (band == null && c.has("url") && fallback == null) fallback = c;
         }
-        return fallback;
+        return old != null ? old : fallback;
     }
 
     static String rupiah(long amount) {
@@ -132,12 +137,8 @@ final class SetorNotifier {
 
     /** Kirim satu uang masuk ke web yang terhubung lalu perbarui notifikasinya. Gagal = dicoba lagi oleh app saat dibuka. */
     static void deliver(Context ctx, JSONObject conn, String id, long amount, long time, String text) {
+        // Jalur sudah dipilih target() (termasuk jalur lama yang masih berlaku)
         String business = conn.optString("business", "web usaha");
-        JSONObject band = conn.optJSONObject("band");
-        if (band != null && !inBand(amount, band.optInt("min"), band.optInt("max"))) {
-            show(ctx, id, rupiah(amount) + " masuk", "DANA · di luar jalur usaha, disimpan di HP saja");
-            return;
-        }
         show(ctx, id, rupiah(amount) + " masuk", "DANA · mengirim ke " + business + "…");
         try {
             HttpURLConnection c = (HttpURLConnection) new URL(conn.getString("url") + "/api/payments/qris/notification").openConnection();

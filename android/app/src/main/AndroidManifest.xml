@@ -4,6 +4,7 @@
     <application
         android:name=".SetorApp"
         android:allowBackup="true"
+        android:requestLegacyExternalStorage="true"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"
@@ -53,4 +54,6 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- Android 13+: izin menampilkan notifikasi Setor (uang masuk) -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Cadangan otomatis ke Documents/Setor: izin hanya dibutuhkan Android 10 ke bawah -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
 </manifest>
